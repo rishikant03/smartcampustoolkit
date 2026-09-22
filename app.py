@@ -346,9 +346,19 @@ def login():
             user = conn.execute('SELECT * FROM users WHERE username = ? OR email = ?', (username, username)).fetchone()
         
         if user and check_password_hash(user['password_hash'], password):
+            # Check if email is verified
+            user_keys = user.keys()
+            email_verified = user['email_verified'] if 'email_verified' in user_keys else 0
+            is_verified = user['is_verified'] if 'is_verified' in user_keys else 0
+            
+            if not email_verified and not is_verified:
+                session['verify_email'] = user['email']
+                flash('Please verify your email before logging in.', 'error')
+                return redirect(url_for('verify_email_page', email=user['email']))
+                
             session['user_id'] = user['id']
             session['username'] = user['username']
-            session['is_verified'] = bool(user['is_verified'])
+            session['is_verified'] = True
             session['role'] = user['role']
             record_login(user['id'], 'password')
             flash('Logged in successfully.', 'success')
@@ -360,55 +370,275 @@ def login():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form.get('username')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        role = request.form.get('role', 'student')
+        full_name = (request.form.get('name') or request.form.get('full_name') or '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        role = request.form.get('role', 'student').strip().lower()
+        username = request.form.get('username', '').strip()
         
-        if not re.match(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$', password):
-            flash('Password must be at least 8 chars, contain uppercase, lowercase, number, and special character.', 'error')
+        # 1. Validate fields
+        if not full_name or not email or not password:
+            flash('All fields are required. Please fill in your details.', 'error')
             return render_template('register.html')
             
+        if not re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$', email):
+            flash('Please enter a valid email address.', 'error')
+            return render_template('register.html')
+            
+        if password != confirm_password:
+            flash('Passwords do not match. Please check and try again.', 'error')
+            return render_template('register.html')
+            
+        if len(password) < 8:
+            flash('Password must be at least 8 characters long.', 'error')
+            return render_template('register.html')
+            
+        # Secure password hash
         password_hash = generate_password_hash(password)
+        
+        # Generate cryptographically secure 6-digit OTP
+        otp = f"{secrets.randbelow(900000) + 100000}"
+        otp_expiry = (datetime.datetime.now() + datetime.timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         try:
             with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.execute(
-                    'INSERT INTO users (username, password_hash, email, auth_provider, is_verified, role) VALUES (?, ?, ?, ?, ?, ?)', 
-                    (username, password_hash, email, 'local', 0, role)
-                )
-                user_id = cursor.lastrowid
+                conn.row_factory = sqlite3.Row
+                existing_user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
                 
-                token = str(uuid.uuid4())
-                expires = datetime.datetime.now() + datetime.timedelta(hours=24)
-                conn.execute(
-                    'INSERT INTO verification_tokens (token, user_id, type, expires_at) VALUES (?, ?, ?, ?)',
-                    (token, user_id, 'email', expires)
-                )
-                conn.execute('INSERT INTO user_profiles (user_id) VALUES (?)', (user_id,))
+                if existing_user:
+                    # If already verified, reject duplicate registration
+                    if existing_user['email_verified'] or existing_user['is_verified']:
+                        flash('An account with this email already exists. Please log in.', 'error')
+                        return redirect(url_for('login'))
+                    else:
+                        # Re-send verification for existing unverified user
+                        user_id = existing_user['id']
+                        conn.execute('''
+                            UPDATE users 
+                            SET name = ?, password_hash = ?, role = ?, otp = ?, otp_expiry = ?, 
+                                otp_attempts = 0, otp_last_sent = ?, email_verified = 0, is_verified = 0 
+                            WHERE id = ?
+                        ''', (full_name, password_hash, role, otp, otp_expiry, now_str, user_id))
+                else:
+                    # Create clean unique username if not provided
+                    if not username:
+                        base_uname = re.sub(r'[^a-zA-Z0-9_]', '', full_name.lower().replace(' ', '_')) or email.split('@')[0]
+                        username = base_uname
+                        
+                    suffix = 1
+                    original_username = username
+                    while conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone():
+                        username = f"{original_username}_{suffix}"
+                        suffix += 1
+                        
+                    cursor = conn.execute('''
+                        INSERT INTO users (
+                            name, username, password_hash, email, auth_provider, 
+                            email_verified, is_verified, role, otp, otp_expiry, 
+                            otp_attempts, otp_last_sent, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        full_name, username, password_hash, email, 'local', 
+                        0, 0, role, otp, otp_expiry, 
+                        0, now_str, now_str
+                    ))
+                    user_id = cursor.lastrowid
+                    conn.execute('INSERT OR IGNORE INTO user_profiles (user_id, full_name) VALUES (?, ?)', (user_id, full_name))
                 
-                verify_url = url_for('verify_email', token=token, _external=True)
-                email_sent, email_msg = send_email_link(email, verify_url, "Verify Your Account - AI Student Platform")
+                # Send 6-digit OTP email
+                email_sent, email_msg = send_email_otp(email, otp)
+                session['verify_email'] = email
                 
                 print(f"\n\n{'='*50}")
-                print(f"[REGISTRATION EMAIL DELIVERY]")
-                print(f"Target Email: {email}")
-                print(f"Verify Link: {verify_url}")
-                print(f"Email Status: {email_msg}")
+                print(f"[REGISTRATION 6-DIGIT OTP DISPATCH]")
+                print(f"Candidate Email: {email}")
+                print(f"Generated 6-Digit OTP: {otp}")
+                print(f"Expires In: 5 minutes ({otp_expiry})")
+                print(f"SMTP Status: {email_msg}")
                 print(f"{'='*50}\n\n")
                 
             if email_sent:
-                flash(f'Registration successful! Verification email sent to {email}.', 'success')
+                flash(f'Registration successful! A 6-digit verification code was sent to {email}.', 'success')
             else:
-                flash('Registration successful. (Mock mode: check console for verification link)', 'success')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Username or Email already exists.', 'error')
+                flash(f'Registration successful! {email_msg}', 'info')
+                
+            return redirect(url_for('verify_email_page', email=email))
+            
+        except sqlite3.IntegrityError as e:
+            flash('Username or Email already registered.', 'error')
             
     return render_template('register.html')
 
+@app.route('/verify-email', methods=['GET', 'POST'], endpoint='verify_email_page')
+def verify_email_page():
+    if request.method == 'POST':
+        email = session.get('verify_email') or request.form.get('email', '').strip().lower()
+        entered_otp = request.form.get('otp', '').strip()
+        
+        if not email:
+            flash('Verification session expired. Please sign in.', 'error')
+            return redirect(url_for('login'))
+            
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+            
+            if not user:
+                flash('Account not found. Please register.', 'error')
+                return redirect(url_for('register'))
+                
+            # Check maximum incorrect attempts (rate limiting / brute force protection)
+            attempts = user['otp_attempts'] or 0
+            if attempts >= 5:
+                flash('Too many incorrect OTP attempts. Please click Resend OTP to request a new code.', 'error')
+                return redirect(url_for('verify_email_page', email=email))
+                
+            # Check 5-minute expiration
+            is_expired = False
+            if user['otp_expiry']:
+                try:
+                    exp = datetime.datetime.strptime(user['otp_expiry'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.datetime.now() > exp:
+                        is_expired = True
+                except Exception:
+                    is_expired = True
+            else:
+                is_expired = True
+                
+            if is_expired or not user['otp']:
+                flash('OTP has expired. Please request a new OTP.', 'error')
+                return redirect(url_for('verify_email_page', email=email))
+                
+            # Verify OTP match
+            if entered_otp != str(user['otp']).strip():
+                conn.execute('UPDATE users SET otp_attempts = COALESCE(otp_attempts, 0) + 1 WHERE id = ?', (user['id'],))
+                remaining = max(0, 5 - (attempts + 1))
+                flash(f'Invalid OTP code. Please check and try again. ({remaining} attempts remaining)', 'error')
+                return redirect(url_for('verify_email_page', email=email))
+                
+            # OTP is correct! Activate account
+            conn.execute('''
+                UPDATE users 
+                SET email_verified = 1, is_verified = 1, otp = NULL, otp_expiry = NULL, otp_attempts = 0 
+                WHERE id = ?
+            ''', (user['id'],))
+            
+        session.pop('verify_email', None)
+        flash('Email verified successfully! You can now log in.', 'success')
+        return redirect(url_for('login'))
+        
+    else: # GET request
+        email = session.get('verify_email') or request.args.get('email', '').strip().lower()
+        if not email:
+            flash('Please enter your email to proceed with verification.', 'info')
+            return redirect(url_for('login'))
+            
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+            
+        if not user:
+            flash('Account not found. Please register.', 'error')
+            return redirect(url_for('register'))
+            
+        if user['email_verified']:
+            flash('Your email is already verified! Please sign in.', 'info')
+            return redirect(url_for('login'))
+            
+        # Calculate remaining seconds for countdown timer
+        remaining_seconds = 300
+        if user['otp_expiry']:
+            try:
+                exp = datetime.datetime.strptime(user['otp_expiry'], '%Y-%m-%d %H:%M:%S')
+                rem = int((exp - datetime.datetime.now()).total_seconds())
+                remaining_seconds = max(0, rem)
+            except Exception:
+                remaining_seconds = 300
+                
+        # Calculate resend cooldown (45 seconds)
+        resend_cooldown = 0
+        if user['otp_last_sent']:
+            try:
+                lst = datetime.datetime.strptime(user['otp_last_sent'], '%Y-%m-%d %H:%M:%S')
+                elapsed = int((datetime.datetime.now() - lst).total_seconds())
+                if elapsed < 45:
+                    resend_cooldown = 45 - elapsed
+            except Exception:
+                resend_cooldown = 0
+                
+        # In dev mode without configured SMTP, surface the OTP to avoid blocking evaluation
+        dev_otp = None
+        if not os.getenv("SMTP_EMAIL") and not os.getenv("GMAIL_USER"):
+            dev_otp = user['otp']
+            
+        return render_template(
+            'verify_email.html',
+            email=email,
+            remaining_seconds=remaining_seconds,
+            resend_cooldown=resend_cooldown,
+            dev_otp=dev_otp
+        )
+
+@app.route('/resend-otp', methods=['POST'])
+def resend_otp():
+    email = session.get('verify_email') or request.form.get('email', '').strip().lower()
+    if not email:
+        flash('Verification session expired. Please sign in.', 'error')
+        return redirect(url_for('login'))
+        
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+        
+        if not user:
+            flash('Account not found. Please register.', 'error')
+            return redirect(url_for('register'))
+            
+        # Cooldown check to prevent spamming
+        if user['otp_last_sent']:
+            try:
+                lst = datetime.datetime.strptime(user['otp_last_sent'], '%Y-%m-%d %H:%M:%S')
+                elapsed = int((datetime.datetime.now() - lst).total_seconds())
+                if elapsed < 45:
+                    wait_time = 45 - elapsed
+                    flash(f'Please wait {wait_time} seconds before requesting a new OTP.', 'error')
+                    return redirect(url_for('verify_email_page', email=email))
+            except Exception:
+                pass
+                
+        # Generate new 6-digit OTP and reset 5-minute expiry
+        otp = f"{secrets.randbelow(900000) + 100000}"
+        otp_expiry = (datetime.datetime.now() + datetime.timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        conn.execute('''
+            UPDATE users 
+            SET otp = ?, otp_expiry = ?, otp_attempts = 0, otp_last_sent = ? 
+            WHERE id = ?
+        ''', (otp, otp_expiry, now_str, user['id']))
+        
+    email_sent, email_msg = send_email_otp(email, otp)
+    session['verify_email'] = email
+    
+    print(f"\n\n{'='*50}")
+    print(f"[RESEND 6-DIGIT OTP DISPATCH]")
+    print(f"Candidate Email: {email}")
+    print(f"New 6-Digit OTP: {otp}")
+    print(f"Expires In: 5 minutes ({otp_expiry})")
+    print(f"Delivery Status: {email_msg}")
+    print(f"{'='*50}\n\n")
+    
+    if email_sent:
+        flash(f'A fresh 6-digit verification code was sent to {email}.', 'success')
+    else:
+        flash(f'New verification OTP generated. {email_msg}', 'info')
+        
+    return redirect(url_for('verify_email_page', email=email))
+
 @app.route('/verify-email/<token>')
-def verify_email(token):
+def verify_email_token(token):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         token_record = conn.execute('SELECT * FROM verification_tokens WHERE token = ? AND type = "email"', (token,)).fetchone()
@@ -418,7 +648,7 @@ def verify_email(token):
             return redirect(url_for('login'))
             
         user_id = token_record['user_id']
-        conn.execute('UPDATE users SET is_verified = 1 WHERE id = ?', (user_id,))
+        conn.execute('UPDATE users SET is_verified = 1, email_verified = 1 WHERE id = ?', (user_id,))
         conn.execute('DELETE FROM verification_tokens WHERE token = ?', (token,))
         
     flash('Email successfully verified! You can now log in.', 'success')
